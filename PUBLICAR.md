@@ -1,28 +1,11 @@
-# Como publicar no seu GitHub
+# Instalação e publicação
 
-O repositório local já está pronto e com o primeiro commit feito:
+O plugin já está publicado no GitHub:
 
-```sh
-cd /home/ext-wrezende/Documentos/deepseek-harness/default-workspace/dsh-excluir-sessao
-```
+- Repositório: <https://github.com/wgrbiss-spec/dsh-excluir-sessao>
+- Versão: `v0.1.0`
 
-O remoto já aponta para `https://github.com/wgrbiss-spec/dsh-excluir-sessao.git`.
-
-## 1. Crie o repositório vazio no GitHub
-
-Abra <https://github.com/new> e crie um repositório chamado **dsh-excluir-sessao**.
-Não marque "Add a README", "Add .gitignore" nem escolha licença: o repositório precisa nascer vazio.
-
-## 2. Envie o código
-
-No seu terminal (o `git` vai pedir usuário e um token pessoal do GitHub no lugar da senha):
-
-```sh
-cd /home/ext-wrezende/Documentos/deepseek-harness/default-workspace/dsh-excluir-sessao
-git push -u origin main
-```
-
-## 3. Instale no DeepSeek Harness
+## 1. Instale no DeepSeek Harness
 
 Antes, remova o plugin original para não ficarem dois menus "Excluir":
 
@@ -40,6 +23,18 @@ O arquivo `dsh-excluir-sessao-0.1.0.tgz` (gerado com `npm pack`) pode ser instal
 ```sh
 dsh plugin --profile desktop add /home/ext-wrezende/Documentos/deepseek-harness/default-workspace/dsh-excluir-sessao/dsh-excluir-sessao-0.1.0.tgz
 ```
+
+Se precisar regerar o pacote depois de mudanças:
+
+```sh
+npm pack
+```
+
+## Publicar uma nova versão
+
+1. Atualize `version` no `package.json` e o `CHANGELOG` (se houver)
+2. `git commit -am "chore: versão X.Y.Z" && git tag vX.Y.Z && git push --follow-tags`
+3. Crie o release: `gh release create vX.Y.Z` ou pela página *Releases* do GitHub
 
 ## Publicar no npm (opcional)
 
