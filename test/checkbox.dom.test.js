@@ -233,6 +233,7 @@ async function loadPlugin(options = {}) {
   const document = {
     body: new StubElement('body'),
     head: new StubElement('head'),
+    documentElement: { lang: '' },
     createElement: (tag) => new StubElement(tag),
     addEventListener(type, handler) {
       const list = documentListeners.get(type) ?? []
@@ -738,6 +739,15 @@ test('a Russian browser gets Russian labels from the built-in dictionary', async
       writable: true,
     })
   }
+})
+
+test('the interface language on <html lang> wins over the browser language', async () => {
+  const harness = await loadPlugin()
+  // The user set the DSH interface to Portuguese while the OS (and navigator)
+  // still reports Chinese: the plugin must follow the interface.
+  harness.document.documentElement.lang = 'pt-BR'
+  assert.equal(deleteRow(harness).element.props.children, 'Excluir sessão')
+  assert.equal(selectRow(harness).element.props.children, 'Selecionar várias')
 })
 
 test('the delete row asks the host for its danger styling', async () => {

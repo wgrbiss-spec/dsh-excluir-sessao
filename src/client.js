@@ -446,20 +446,34 @@ window.__ModuleLoader__.load({
     let localeSvc = null
 
     const OWN_DICTIONARY_FIRST = new Set(['ru', 'pt'])
+    const SHIPPED_LANGS = new Set(['zh', 'en', 'ru', 'pt'])
+
+    /** The language the DSH document declares, when it declares one. */
+    function documentLang() {
+      if (typeof document === 'undefined') return ''
+      const root = document.documentElement || (document.body && document.body.parentElement)
+      const lang = root && typeof root.lang === 'string' ? root.lang : ''
+      return String(lang || '').toLowerCase().split('-')[0]
+    }
 
     function browserLang() {
+      // The `<html lang>` DSH sets reflects the interface language picked in the
+      // settings, which can differ from the operating system language reported by
+      // `navigator`. Prefer it so the plugin follows the interface.
+      const doc = documentLang()
+      if (SHIPPED_LANGS.has(doc)) return doc
       if (typeof navigator === 'undefined') return 'pt'
       for (const tag of (navigator.languages || []).concat([navigator.language])) {
         const primary = String(tag || '').toLowerCase().split('-')[0]
-        if (primary === 'zh' || primary === 'en' || primary === 'ru' || primary === 'pt') return primary
+        if (SHIPPED_LANGS.has(primary)) return primary
       }
       return 'pt'
     }
 
     const dictionaries = { zh, en, ru, pt }
 
-    // The dictionary the built-in lookup reads: the browser's language when it is
-    // one we ship, Brazilian Portuguese otherwise.
+    // The dictionary the built-in lookup reads: the interface (or browser)
+    // language when it is one we ship, Brazilian Portuguese otherwise.
     function activeDictionary() {
       return dictionaries[browserLang()] || pt
     }
