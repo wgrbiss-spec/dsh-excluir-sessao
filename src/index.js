@@ -1,0 +1,2274 @@
+// dsh-excluir-sessao - host half.
+//
+// Loopback-only HTTP routes serve the client half:
+//
+//   POST /dsh-excluir-sessao/delete   { sessionId }
+//
+// Deletion pipeline, kept consistent with the live DSH services so in-memory
+// state and on-disk units cannot disagree after the request returns:
+//
+//   1. stop a running agent (cancel + time-boxed quiescence) when one exists;
+//   2. flush and detach the live session so its async dispose cannot rewrite
+//      the log directory after we remove it, and wait for the persistence
+//      retirement that session/disposed starts;
+//   3. take the persistence write lease briefly: a busy lease means the
+//      session is still open in DSH, so the request is refused with 409
+//      instead of racing the active writer;
+//   4. remove every on-disk session directory (raw id and session- prefix);
+//   5. verify through the persistence service and a directory re-scan;
+//   6. detach the session from workspace accounting so the sidebar drops the
+//      row instead of re-grouping an orphan under "Ungrouped".
+//
+// The plugin imports nothing from the DSH SDK: every service is resolved
+// through the cordis context at call time, so the module loads on any profile
+// and degrades to the filesystem path when a service is absent.
+import { spawn } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { promisify } from 'node:util'
+
+/** The asynchronous face of `fs`, used wherever a blocking call could stall the server. */
+const fsp = fs.promises
+/** The same underlying call as `fs.realpathSync.native`, just not blocking. */
+const realpathNative = promisify(fs.realpath.native)
+
+export const name = 'dsh-excluir-sessao'
+
+const ROUTE_PREFIX = '/dsh-excluir-sessao'
+// A session id is an OPAQUE string to DSH: the host's own schema is
+// `z.string().min(1)`, and a named session created in the GUI (`bili-whale`,
+// stored as ~/.dsh/storages/<profile>/sessions/bili-whale.json) is exactly as
+// real as a UUID one. A UUID-only test rejected those with a 400 - the panel
+// then answered "Falha ao carregar o status" for a session that plainly exists, and a session
+// list filtered by it hid them. The character class still refuses everything
+// that could leave a path or a URL: `/`, `\`, `..` (the first character must be
+// alphanumeric, so a leading dot is already out), whitespace and control
+// characters.
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const MAX_BATCH = 100
+
+class HttpError extends Error {
+  constructor(status, code, message) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+// --- paths -------------------------------------------------------------------
+
+function dshHome() {
+  return process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+}
+
+function sessionsRoot() {
+  return path.join(dshHome(), 'sessions')
+}
+
+// A session id travels in two spellings: the raw uuid and `session-<uuid>`.
+// The on-disk JSONL backend uses the prefixed form for the directory name,
+// while workspace and projection rows may carry either. Clean both.
+function idVariants(sessionId) {
+  const out = new Set([sessionId])
+  if (sessionId.startsWith('session-')) out.add(sessionId.slice('session-'.length))
+  else out.add(`session-${sessionId}`)
+  return [...out]
+}
+/** The bare uuid, for comparing ids that may or may not carry the prefix. */
+function bareSessionId(sessionId) {
+  return sessionId.startsWith('session-') ? sessionId.slice('session-'.length) : sessionId
+}
+
+/**
+ * Every session header the host knows about, or `[]` when no service can list
+ * them. `sessionQuery` merges live and persisted sessions and carries
+ * `parentSession`, so the parent/child map never has to be decoded out of the
+ * zstd logs.
+ */
+async function listSessionHeaders(ctx) {
+  try {
+    const query = ctx.get('sessionQuery')
+    if (query && typeof query.listSessions === 'function') {
+      const records = await query.listSessions()
+      const headers = records
+        .map((record) => record && record.header)
+        .filter((header) => header && typeof header.id === 'string')
+      if (headers.length > 0) return headers
+    }
+  } catch {
+    // fall through to the persistence service
+  }
+  try {
+    const persistence = ctx.get('sessionPersistence')
+    if (persistence && typeof persistence.list === 'function') {
+      const snapshots = await persistence.list({})
+      return snapshots
+        .map((snapshot) => snapshot && snapshot.header)
+        .filter((header) => header && typeof header.id === 'string')
+    }
+  } catch {
+    // no service can list sessions on this host
+  }
+  return []
+}
+
+/**
+ * Every descendant of one session, breadth first. A subagent is a session of
+ * its own — its own directory and its own log — linked only by `parentSession`,
+ * so a delete that ignores the link leaves orphans behind.
+ *
+ * @param headers - the host session headers.
+ * @param sessionId - the session being deleted.
+ * @returns descendant headers, parents before their own children.
+ */
+function collectDescendants(headers, sessionId) {
+  const byParent = new Map()
+  for (const header of headers) {
+    if (typeof header.parentSession !== 'string') continue
+    // Only subagents belong to a parent. A fork records where it branched from,
+    // but it is a conversation of its own and the user can open it like any other:
+    // sweeping those up deletes work nobody asked to delete.
+    if (header.origin !== 'subagent') continue
+    const key = bareSessionId(header.parentSession)
+    const list = byParent.get(key)
+    if (list === undefined) byParent.set(key, [header])
+    else list.push(header)
+  }
+  const found = []
+  const seen = new Set([bareSessionId(sessionId)])
+  const queue = [bareSessionId(sessionId)]
+  while (queue.length > 0) {
+    const current = queue.shift()
+    for (const child of byParent.get(current) ?? []) {
+      const key = bareSessionId(child.id)
+      if (seen.has(key)) continue
+      seen.add(key)
+      found.push(child)
+      queue.push(key)
+    }
+  }
+  return found
+}
+
+/**
+ * Sessions whose parent no longer exists. Deleting a parent used to leave these
+ * on disk, and the sidebar cannot show the ones that never joined a workspace.
+ */
+function collectOrphans(headers) {
+  const present = new Set(headers.map((entry) => bareSessionId(entry.id)))
+  // Same rule as the descendant walk: a fork whose source is gone is still a
+  // conversation of its own, not an abandoned child.
+  return headers.filter((entry) => entry.origin === 'subagent'
+    && typeof entry.parentSession === 'string'
+    && !present.has(bareSessionId(entry.parentSession)))
+}
+
+/**
+ * The child list the dialog shows: identity, nesting depth and the project the
+ * subagent ran in, so the names are recognisable before anything is ticked.
+ */
+function describeChildren(headers, sessionId) {
+  const byBare = new Map(headers.map((entry) => [bareSessionId(entry.id), entry]))
+  return collectDescendants(headers, sessionId).map((entry) => {
+    let depth = 1
+    let cursor = entry
+    while (typeof cursor.parentSession === 'string') {
+      const parent = byBare.get(bareSessionId(cursor.parentSession))
+      if (parent === undefined || bareSessionId(parent.id) === bareSessionId(sessionId)) break
+      depth += 1
+      cursor = parent
+    }
+    return {
+      id: entry.id,
+      depth,
+      cwd: typeof entry.cwd === 'string' ? entry.cwd : undefined,
+    }
+  })
+}
+
+/**
+ * The children the caller asked to delete, narrowed to real descendants. A
+ * stale or unrelated id is dropped instead of failing the delete: the parent is
+ * the session the user clicked, and that click must still land.
+ *
+ * @returns the descendants' own ids, in the order they were asked for.
+ */
+function selectChildDeletes(headers, sessionId, requested) {
+  if (!Array.isArray(requested) || requested.length === 0) return []
+  const descendants = new Map()
+  for (const entry of collectDescendants(headers, sessionId)) {
+    descendants.set(bareSessionId(entry.id), entry.id)
+  }
+  const picked = []
+  for (const id of requested) {
+    if (typeof id !== 'string' || id === '') continue
+    const hit = descendants.get(bareSessionId(id))
+    if (hit !== undefined && !picked.includes(hit)) picked.push(hit)
+  }
+  return picked
+}
+
+// Scan every workspace directory under $DSH_HOME/sessions for the session's
+// directories, so the workspace-path encoding never has to be re-derived here.
+function findSessionDirs(sessionId) {
+  const root = sessionsRoot()
+  let entries
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const variants = idVariants(sessionId)
+  const found = []
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    for (const variant of variants) {
+      const candidate = path.join(root, entry.name, variant)
+      try {
+        if (fs.statSync(candidate).isDirectory() && !found.includes(candidate)) found.push(candidate)
+      } catch {
+        // keep scanning
+      }
+    }
+  }
+  return found
+}
+
+/**
+ * The C# behind the cached recycle helper. One process handles every path of a
+ * delete (the session directory and its cache rows), because each PowerShell
+ * start costs the better part of a second and a delete used to pay it twice.
+ */
+const RECYCLE_CSHARP = `using System;
+using System.IO;
+using Microsoft.VisualBasic.FileIO;
+
+public static class Program {
+  public static int Main(string[] args) {
+    int done = 0;
+    foreach (string target in args) {
+      try {
+        if (Directory.Exists(target)) {
+          FileSystem.DeleteDirectory(target, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
+        } else if (File.Exists(target)) {
+          FileSystem.DeleteFile(target, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
+        }
+        done++;
+      } catch {
+        // leave it: the caller verifies the path is gone
+      }
+    }
+    return done == args.Length ? 0 : 1;
+  }
+}`
+
+/** Bump when `RECYCLE_CSHARP` changes, so a cached build is not reused. */
+const RECYCLE_EXE_VERSION = 1
+const RECYCLE_TIMEOUT_MS = 60 * 1000
+
+/** The C# compiler that ships with .NET Framework, if this machine has it. */
+function findCsc() {
+  const windir = process.env.WINDIR || 'C:\\Windows'
+  for (const flavor of ['Framework64', 'Framework']) {
+    const candidate = path.join(windir, 'Microsoft.NET', flavor, 'v4.0.30319', 'csc.exe')
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate
+    } catch {
+      // try the next flavour
+    }
+  }
+  return null
+}
+
+/** Compile the recycle helper once into the DSH cache; null when it cannot. */
+async function ensureRecycleExe() {
+  if (process.platform !== 'win32') return null
+  const dir = path.join(dshHome(), 'cache', 'dsh-excluir-sessao', `v${RECYCLE_EXE_VERSION}`)
+  const exe = path.join(dir, 'dsh-recycle.exe')
+  if (await pathExists(exe)) return exe
+  const csc = findCsc()
+  if (csc === null) return null
+  try {
+    await fsp.mkdir(dir, { recursive: true })
+    const source = path.join(dir, 'recycle.cs')
+    await fsp.writeFile(source, RECYCLE_CSHARP, 'utf8')
+    const built = await runExecutable(csc, ['-nologo', '-target:exe', `-out:${exe}`, '-r:System.dll', '-r:Microsoft.VisualBasic.dll', source], PICK_COMPILE_TIMEOUT_MS)
+    try { await fsp.rm(source, { force: true }) } catch { /* best effort */ }
+    if (built.code === 0) {
+      if (await pathExists(exe)) return exe
+    }
+  } catch {
+    // fall through to the PowerShell path
+  }
+  return null
+}
+
+/**
+ * The command that hands paths to the platform trash.
+ *
+ * Windows is done in-process (see `sendToRecycleBin`); macOS has no trash command
+ * of its own, so Finder performs the delete, and Linux delegates to `gio trash`,
+ * which ships with GLib on every mainstream desktop. Kept separate from running
+ * it so the shape can be tested on a machine that has neither.
+ */
+/**
+ * Compile the helper executables while nothing is waiting for them. The first
+ * pick or delete otherwise pays for `csc` (0.5-1.7 s); by the time the user
+ * clicks, the cache is already there.
+ *
+ * Deliberately fire-and-forget and never fatal: a machine without `csc` keeps
+ * the PowerShell fallbacks, and a failure here must not stop the plugin loading.
+ */
+function warmCompiledHelpers() {
+  if (process.platform !== 'win32') return
+  const warm = async () => {
+    try { await ensureRecycleExe() } catch { /* the fallback covers it */ }
+  }
+  void warm()
+}
+function trashCommandFor(platform, targets) {
+  if (platform === 'darwin') {
+    // One -e per path: AppleScript has no list form for this, and a failure on one
+    // path must not stop the rest.
+    return {
+      program: 'osascript',
+      args: targets.flatMap((target) => [
+        '-e',
+        `tell application "Finder" to delete (POSIX file "${target.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}")`,
+      ]),
+    }
+  }
+  return { program: 'gio', args: ['trash', ...targets] }
+}
+
+/**
+ * Run the platform trash command. Returns false when the command is missing
+ * (`gio` on a bare container, a denied Finder automation prompt) so the caller
+ * keeps the staged copy instead of pretending the delete happened.
+ */
+async function trashWithSystem(targets, platform) {
+  const command = trashCommandFor(platform, targets)
+  try {
+    const run = await runExecutable(command.program, command.args, RECYCLE_TIMEOUT_MS)
+    return run.code === 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Send paths to the Windows Recycle Bin.
+ *
+ * A delete has to be undoable, and the Recycle Bin is the undo the user already
+ * knows. Node has no API for it, and a Node process cannot synthesize the
+ * `$I`/`$R` pair the Shell owns, so one PowerShell does the work through
+ * `Microsoft.VisualBasic.FileIO.FileSystem` — the supported managed wrapper of
+ * "delete with undo". The script prints one verdict per path, so a partial
+ * failure is reported instead of being assumed away.
+ *
+ * @returns `true` only when every path actually left its original location.
+ */
+async function sendToRecycleBin(targets) {
+  if (targets.length === 0) return true
+  // macOS and Linux have their own trash; Windows is handled below in-process.
+  if (process.platform !== 'win32') return trashWithSystem(targets, process.platform)
+
+  // The compiled helper answers in ~100 ms where one PowerShell start costs the
+  // better part of a second, and it takes every path of a delete at once.
+  const exe = await ensureRecycleExe()
+  if (exe !== null) {
+    try {
+      const run = await runExecutable(exe, targets, RECYCLE_TIMEOUT_MS)
+      return run.code === 0
+    } catch {
+      return false
+    }
+  }
+
+  const list = targets.map((target) => `'${target.replace(/'/g, "''")}'`).join(', ')
+  const script = [
+    'Add-Type -AssemblyName Microsoft.VisualBasic',
+    `$targets = @(${list})`,
+    'foreach ($target in $targets) {',
+    '  try {',
+    '    if (Test-Path -LiteralPath $target -PathType Container) {',
+    '      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target,',
+    '        [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,',
+    '        [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)',
+    '    } elseif (Test-Path -LiteralPath $target) {',
+    '      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($target,',
+    '        [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,',
+    '        [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)',
+    '    }',
+    '    [Console]::Out.WriteLine(\'OK\')',
+    '  } catch {',
+    '    [Console]::Out.WriteLine(\'FAIL\')',
+    '  }',
+    '}',
+  ].join('\r\n')
+
+  const scriptPath = path.join(os.tmpdir(), `dsh-excluir-sessao-bin-${process.pid}-${Date.now()}.ps1`)
+  const bytes = Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(script, 'utf8')])
+  let output
+  try {
+    await fsp.writeFile(scriptPath, bytes)
+    output = await runPowershell(
+      ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      SHELL_TIMEOUT_MS,
+    )
+  } catch {
+    return false
+  } finally {
+    try { await fsp.rm(scriptPath, { force: true }) } catch { /* best effort */ }
+  }
+  const ok = output.split(/\r?\n/).filter((line) => line.trim() === 'OK').length
+  return ok === targets.length
+}
+
+/**
+ * Move paths into a fresh `$DSH_HOME/session-trash-<stamp>` folder.
+ *
+ * This is the fast half of a retire: a same-volume rename costs microseconds,
+ * while the shell's recycle operation costs ~600 ms. The caller reports the
+ * delete as done after this, so the wait never reaches the user.
+ *
+ * @returns `{ moved, root }` — the source paths and the staging folder, or a null
+ *   root when the folder could not be created.
+ */
+async function stageToTrash(targets) {
+  if (targets.length === 0) return { moved: [], root: null }
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 17)
+  const root = path.join(dshHome(), `session-trash-${stamp}-${process.pid}-${retireCounter++}`)
+  try {
+    await fsp.mkdir(root, { recursive: true })
+  } catch {
+    return { moved: [], root: null }
+  }
+  const moved = []
+  for (const target of targets) {
+    const destination = await freeDestination(root, path.basename(target))
+    if (destination === undefined) continue
+    try {
+      await fsp.rename(target, destination)
+      moved.push(target)
+      continue
+    } catch {
+      // A cross-volume rename fails; copy then drop the original.
+    }
+    try {
+      await fsp.cp(target, destination, { recursive: true, force: false, errorOnExist: true })
+      await fsp.rm(target, { recursive: true, force: true })
+      moved.push(target)
+    } catch {
+      // Leave it: a path that cannot be retired is reported by the caller.
+    }
+  }
+  return { moved, root: moved.length > 0 ? root : null }
+}
+
+/** Keeps two retires in the same millisecond out of one staging folder. */
+let retireCounter = 0
+
+/** The staging move alone, for callers that just want the paths out of the way. */
+async function moveToSessionTrash(targets) {
+  return (await stageToTrash(targets)).moved
+}
+
+/**
+ * Retire paths for good. The caller gets control back as soon as the paths are
+ * out of their original location — a same-volume rename — and the Recycle Bin
+ * move finishes in the background.
+ *
+ * That order is deliberate: the shell's recycle operation costs ~600 ms, which
+ * is exactly the wait a delete should not have. If the background call fails, the
+ * paths are still in `session-trash-<stamp>` and recoverable by hand; nothing is
+ * ever unlinked.
+ */
+async function retirePaths(targets) {
+  if (targets.length === 0) return []
+  const staged = await stageToTrash(targets)
+  if (staged.root !== null) {
+    // Fire and forget: never awaited, never allowed to reject into the caller.
+    try {
+      sendToRecycleBin([staged.root]).catch(() => {})
+    } catch {
+      // the staged copy stays where it is
+    }
+  }
+  return staged.moved
+}
+
+/**
+ * Remove paths outright. This is the branch behind the unchecked Recycle Bin
+ * switch: the dialog says the delete is permanent in that state, so the files
+ * must not linger anywhere. Every other path through this plugin retires to the
+ * bin, and that difference is the whole point of the switch.
+ *
+ * @returns the paths that are gone afterwards.
+ */
+function removeForever(targets) {
+  const gone = []
+  for (const target of targets) {
+    if (!fs.existsSync(target)) continue
+    try {
+      fs.rmSync(target, { recursive: true, force: true })
+      if (!fs.existsSync(target)) gone.push(target)
+    } catch {
+      // reported by the caller's own existence checks
+    }
+  }
+  return gone
+}
+/**
+ * Retire a list according to the switch: into the system trash (staged first,
+ * then the shell takes it) or off the disk. Kept separate from the delete so the
+ * choice itself can be tested without standing up a whole session.
+ */
+async function retireTargets(targets, recycle) {
+  return recycle ? retirePaths(targets) : removeForever(targets)
+}
+async function retireSessionDirs(sessionId) {
+  return retirePaths(findSessionDirs(sessionId))
+}
+
+// Deleting the on-disk directory is not enough: projection caches keep a
+// per-session JSON row (`$DSH_HOME/storages/<store>/sessions/<id>.json`) that
+// would linger as a ghost — the sidebar list is directory-backed, so the row
+// can never be shown or deleted again (issue: "can't delete anymore"). Retire
+// the session's cache units together with its directories.
+function findSessionCaches(sessionId) {
+  const storesRoot = path.join(dshHome(), 'storages')
+  const found = []
+  let stores
+  try {
+    stores = fs.readdirSync(storesRoot, { withFileTypes: true })
+  } catch {
+    return found
+  }
+  const names = idVariants(sessionId).map((variant) => `${variant}.json`)
+  for (const store of stores) {
+    if (!store.isDirectory()) continue
+    const dir = path.join(storesRoot, store.name, 'sessions')
+    let entries
+    try {
+      entries = fs.readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      if (!names.includes(entry)) continue
+      found.push(path.join(dir, entry))
+    }
+  }
+  return found
+}
+
+async function retireSessionCaches(sessionId) {
+  return retirePaths(findSessionCaches(sessionId))
+}
+
+// --- live state --------------------------------------------------------------
+
+// Stop a running agent before its session disappears: cancel the active turn
+// and wait, time-boxed, so a stuck driver never blocks the deletion.
+async function quiesceAgent(ctx, sessionId) {
+  const agents = ctx.get('agents')
+  if (!agents || typeof agents.get !== 'function') return false
+  const agent = agents.get(sessionId)
+  if (!agent) return false
+  try {
+    if (typeof agent.cancel === 'function') agent.cancel({ kind: 'user' })
+  } catch {
+    // agent may already be settling
+  }
+  if (typeof agent.whenIdle === 'function') {
+    try {
+      await Promise.race([agent.whenIdle(), new Promise((resolve) => setTimeout(resolve, 10000))])
+    } catch {
+      // proceed with deletion anyway
+    }
+  }
+  return true
+}
+
+// Flush a live session, then detach its entered record so DSH emits
+// host/session-removed and the client list drops the row. The persistence
+// retirement started by session/disposed is awaited before the caller unlinks
+// anything, because its final drain could otherwise recreate the directory.
+async function flushAndDetach(ctx, sessionId) {
+  const sessions = ctx.get('sessions')
+  let flushed = false
+  let detached = false
+  if (sessions) {
+    for (const variant of idVariants(sessionId)) {
+      const live = typeof sessions.get === 'function' ? sessions.get(variant) : undefined
+      if (!live) continue
+      if (typeof sessions.flush === 'function') {
+        try {
+          await sessions.flush(live)
+          flushed = true
+        } catch {
+          // the log is removed anyway
+        }
+      }
+      try {
+        const entered = sessions.store && typeof sessions.store.get === 'function' ? sessions.store.get(variant) : undefined
+        if (entered && typeof entered.detach === 'function') {
+          entered.detach()
+          detached = true
+        }
+      } catch {
+        // best effort: the directory removal below is the authority
+      }
+    }
+  }
+  const sp = ctx.get('sessionPersistence')
+  try {
+    const retirement = sp && sp.retirements && typeof sp.retirements.get === 'function' ? sp.retirements.get(sessionId) : undefined
+    if (retirement && typeof retirement.then === 'function') await retirement
+  } catch {
+    // no retirement registry: nothing to wait for
+  }
+  return { flushed, detached }
+}
+
+// Probe the persistence write lease. Holding it proves no active writer is
+// around; it is released immediately. Detaching a live session releases its
+// lease asynchronously (session/disposed starts a persistence retirement), so
+// the probe is retried with a short backoff before the request is refused -
+// in practice the first click then succeeds without forcing anything.
+// A live session is the common case: detaching releases the write lease through
+// an asynchronous retirement, so the FIRST probe almost always finds it busy.
+// A flat 200ms delay therefore charged every live delete ~200ms before it even
+// started. The wait is now exponential — 20, 40, 80, 160, then the old 200ms —
+// which lands the typical case in ~20-40ms and keeps the ceiling unchanged
+// (total wait is shorter than 12 x 200ms, never longer).
+const BUSY_RETRY_ATTEMPTS = 12
+const BUSY_RETRY_BASE_MS = 20
+const BUSY_RETRY_MAX_MS = 200
+
+/**
+ * How long to wait before retry `attempt` (1-based).
+ * @param attempt - the retry about to happen.
+ * @returns milliseconds to sleep.
+ */
+function busyBackoff(attempt) {
+  const step = BUSY_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1)
+  return Math.min(step, BUSY_RETRY_MAX_MS)
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function assertNoActiveWriter(ctx, sessionId) {
+  const sp = ctx.get('sessionPersistence')
+  if (!sp || typeof sp.open !== 'function') return false
+  for (let attempt = 1; attempt <= BUSY_RETRY_ATTEMPTS; attempt += 1) {
+    let handle = null
+    let busy = false
+    try {
+      handle = await sp.open(sessionId, 'write')
+    } catch (error) {
+      const message = String((error && error.message) || error)
+      if (/own|busy|lock|hold|writer/i.test(message)) {
+        busy = true
+      } else {
+        return false
+      }
+    } finally {
+      try {
+        if (handle && typeof handle.close === 'function') await handle.close()
+      } catch {
+        // lease release failure is harmless: the directory is removed next
+      }
+    }
+    if (!busy) return true
+    if (attempt < BUSY_RETRY_ATTEMPTS) await sleep(busyBackoff(attempt))
+  }
+  throw new HttpError(409, 'busy', 'A sessão está aberta no DSH agora')
+}
+
+// Bounded concurrency for batch deletes. Different sessions are independent
+// (agent quiesce, lease probe and directory sweep all key off the session id),
+// so the pipeline runs in parallel through a small pool. The one shared
+// mutation - workspace accounting - is serialized through withWorkspaceLock so
+// two deletions can never interleave on the same store.
+//
+// 6 is measured, not guessed: on 64 sessions of ~2MB the wall time was
+// 281ms at 4, 189ms at 6 and 142ms at 8 (the I/O parallelism saturates around
+// 8), so 6 keeps a ~33% gain over 4 while staying below the saturation knee
+// and limiting the number of simultaneous lease-probe loops.
+const BATCH_CONCURRENCY = 6
+// The lease probe is a few milliseconds of waiting, not I/O: it can run wider
+// than the file sweep without adding load, and that width is the whole point of
+// phase 2 of the batch pipeline.
+const BATCH_PROBE_CONCURRENCY = 16
+
+let workspaceLock = Promise.resolve()
+function withWorkspaceLock(fn) {
+  const run = workspaceLock.then(fn, fn)
+  workspaceLock = run.then(() => undefined, () => undefined)
+  return run
+}
+
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length)
+  let cursor = 0
+  const runners = []
+  for (let i = 0; i < Math.min(limit, items.length); i += 1) {
+    runners.push((async () => {
+      while (true) {
+        const index = cursor
+        cursor += 1
+        if (index >= items.length) return
+        results[index] = await worker(items[index], index)
+      }
+    })())
+  }
+  await Promise.all(runners)
+  return results
+}
+
+async function detachFromWorkspace(ctx, sessionId) {
+  const workspace = ctx.get('workspaceRegistry')
+  if (!workspace) return false
+  const variants = idVariants(sessionId)
+  let touched = false
+  try {
+    if (typeof workspace.list === 'function') {
+      for (const entry of workspace.list()) {
+        if (!entry || !Array.isArray(entry.sessionIds)) continue
+        if (!variants.some((variant) => entry.sessionIds.includes(variant))) continue
+        try {
+          await entry.detachSession(sessionId)
+          touched = true
+        } catch {
+          // keep going: the header index cleanup below still applies
+        }
+      }
+    }
+  } catch {
+    // registry unavailable
+  }
+  try {
+    if (workspace.sessionPaths && typeof workspace.sessionPaths.delete === 'function') {
+      for (const variant of variants) workspace.sessionPaths.delete(variant)
+    }
+  } catch {
+    // private map absent on this version
+  }
+  try {
+    if (workspace.headers && typeof workspace.headers.delete === 'function') {
+      for (const variant of variants) workspace.headers.delete(variant)
+    }
+  } catch {
+    // private map absent on this version
+  }
+  return touched
+}
+
+// --- core delete -------------------------------------------------------------
+
+/**
+ * Phase 1 - stop everything that writes to a session and flush its log.
+ * Cheap and independent per session, so a batch runs these together.
+ */
+async function stopSession(ctx, sessionId) {
+  await quiesceAgent(ctx, sessionId)
+  return flushAndDetach(ctx, sessionId)
+}
+
+/** Phase 2 - wait for the write lease. The waits of different sessions overlap. */
+async function requireWritable(ctx, sessionId) {
+  await assertNoActiveWriter(ctx, sessionId)
+}
+
+/**
+ * Phase 3 - retire the files, verify, drop the workspace accounting, then take
+ * the ticked child sessions with it.
+ *
+ * Children stay sequential and last: one failure never takes the parent result
+ * down with it, because the parent is what the user clicked.
+ *
+ * @returns `{ removed, caches, workspaceDetached, children }`.
+ */
+async function retireSession(ctx, sessionId, options, stopResult) {
+  const recycle = options === undefined || options === null || options.recycle !== false
+  const childSessionIds = options !== undefined && options !== null && Array.isArray(options.childSessionIds)
+    ? options.childSessionIds
+      .filter((id) => typeof id === 'string' && SESSION_ID_RE.test(id))
+      .filter((id) => bareSessionId(id) !== bareSessionId(sessionId))
+    : []
+  const flushed = stopResult !== undefined && stopResult !== null && stopResult.flushed === true
+  const detached = stopResult !== undefined && stopResult !== null && stopResult.detached === true
+
+  const { removed, caches } = await retireSessionFiles(sessionId, recycle)
+
+  const sp = ctx.get('sessionPersistence')
+  if (sp && typeof sp.stat === 'function') {
+    const after = await sp.stat(sessionId).catch(() => undefined)
+    if (after) {
+      throw new HttpError(500, 'verify-failed', 'A sessão ainda aparece no serviço de persistência após a exclusão')
+    }
+  }
+  const leftover = findSessionDirs(sessionId)
+  if (leftover.length > 0) {
+    throw new HttpError(500, 'verify-failed', 'Não foi possível remover totalmente os diretórios da sessão')
+  }
+
+  const workspaceDetached = await withWorkspaceLock(() => detachFromWorkspace(ctx, sessionId))
+  if (removed === 0 && !workspaceDetached && !flushed && !detached && caches === 0) {
+    throw new HttpError(404, 'not-found', 'Sessão não encontrada')
+  }
+
+  const children = []
+  for (const childId of childSessionIds) {
+    try {
+      // A subagent can still be running while its parent is deleted. Removing the
+      // log out from under it is what made the agent's next write fail with ENOENT,
+      // so a child gets the same guard as the parent: stop it, flush it, and wait
+      // for the write lease before a single byte moves.
+      await quiesceAgent(ctx, childId)
+      await flushAndDetach(ctx, childId)
+      await assertNoActiveWriter(ctx, childId)
+      const childFiles = await retireSessionFiles(childId, recycle)
+      await withWorkspaceLock(() => detachFromWorkspace(ctx, childId))
+      children.push({ id: childId, removed: childFiles.removed, caches: childFiles.caches })
+    } catch (error) {
+      // Never delete a child that could not be quieted: something is still writing
+      // to it. Report it so the caller can try again once it settles.
+      const busy = error instanceof HttpError && error.code === 'busy'
+      children.push({
+        id: childId,
+        removed: 0,
+        caches: 0,
+        skipped: busy ? 'busy' : 'error',
+        error: String((error && error.message) || error),
+      })
+    }
+  }
+
+  return { removed, caches, workspaceDetached, children }
+}
+
+/**
+ * Delete one session: the three phases in order. Kept as the single-session
+ * entry point, and expressed in the same phase helpers the batch uses so the two
+ * can never drift apart.
+ */
+async function deleteSession(ctx, sessionId, options) {
+  if (!SESSION_ID_RE.test(sessionId)) {
+    throw new HttpError(400, 'invalid', 'ID de sessão inválido')
+  }
+  const stopResult = await stopSession(ctx, sessionId)
+  await requireWritable(ctx, sessionId)
+  const result = await retireSession(ctx, sessionId, options, stopResult)
+  return {
+    removed: result.removed,
+    caches: result.caches,
+    stopped: stopResult !== undefined && stopResult.flushed !== undefined,
+    flushed: stopResult.flushed,
+    detached: stopResult.detached,
+    workspaceDetached: result.workspaceDetached,
+    children: result.children,
+  }
+}
+
+/**
+ * Delete many sessions as three overlapping phases:
+ *
+ *   1. stop and flush every session (bounded, but the work is tiny)
+ *   2. probe every write lease (wide: these are the 20-40ms waits, and they only
+ *      overlap if nothing queues behind the retire workers)
+ *   3. retire files, verify, detach accounting, take children (bounded)
+ *
+ * The old shape ran all three phases inside each session, six at a time, so a
+ * batch of live sessions paid its lease waits in waves. One failing session never
+ * takes the batch down: it comes back as `{ ok: false }`.
+ *
+ * @returns one `{ sessionId, ok, removed }` (or `{ ok: false, code, error }`) per id.
+ */
+async function deleteSessions(ctx, sessionIds, options) {
+  const valid = []
+  const rejected = []
+  for (const sessionId of sessionIds) {
+    if (SESSION_ID_RE.test(sessionId)) valid.push(sessionId)
+    else rejected.push({ sessionId, ok: false, code: 'invalid', error: 'ID de sessão inválido' })
+  }
+
+  // Phase 1: stop + flush. A failure here is that session's failure only.
+  const stopped = new Map()
+  const stopErrors = new Map()
+  await runWithConcurrency(valid, BATCH_CONCURRENCY, async (sessionId) => {
+    try {
+      stopped.set(sessionId, await stopSession(ctx, sessionId))
+    } catch (error) {
+      stopErrors.set(sessionId, error)
+    }
+  })
+
+  // Phase 2: lease probe, wide. Sessions that never stopped are not probed.
+  const unready = new Map()
+  const ready = valid.filter((sessionId) => !stopErrors.has(sessionId))
+  await runWithConcurrency(ready, BATCH_PROBE_CONCURRENCY, async (sessionId) => {
+    try {
+      await requireWritable(ctx, sessionId)
+    } catch (error) {
+      unready.set(sessionId, error)
+    }
+  })
+
+  // Phase 3: retire what is clear to go.
+  const results = []
+  const swept = valid.filter((sessionId) => !stopErrors.has(sessionId) && !unready.has(sessionId))
+  const retired = new Map()
+  const retireErrors = new Map()
+  await runWithConcurrency(swept, BATCH_CONCURRENCY, async (sessionId) => {
+    try {
+      retired.set(sessionId, await retireSession(ctx, sessionId, options, stopped.get(sessionId)))
+    } catch (error) {
+      retireErrors.set(sessionId, error)
+    }
+  })
+
+  for (const sessionId of valid) {
+    const error = stopErrors.get(sessionId) || unready.get(sessionId) || retireErrors.get(sessionId)
+    if (error !== undefined) {
+      results.push({
+        sessionId,
+        ok: false,
+        code: error instanceof HttpError ? error.code : 'internal',
+        error: String((error && error.message) || error),
+      })
+      continue
+    }
+    results.push({ sessionId, ok: true, removed: retired.get(sessionId).removed })
+  }
+
+  return [...results, ...rejected]
+}
+/**
+ * Take one session off the disk: its directories and its cache rows, then any
+ * directory the drain recreated. Shared by the parent and every child, so a
+ * subagent is retired exactly like the conversation the user clicked.
+ *
+ * @returns how many paths went away, and how many cache rows are now gone.
+ */
+async function retireSessionFiles(sessionId, recycle) {
+  const cacheFiles = findSessionCaches(sessionId)
+  const targets = [...findSessionDirs(sessionId), ...cacheFiles]
+  let gone = await retireTargets(targets, recycle)
+  await new Promise((resolve) => setImmediate(resolve))
+  gone = gone.concat(await retireTargets(findSessionDirs(sessionId), recycle))
+  return { removed: gone.length, caches: cacheFiles.filter((file) => !fs.existsSync(file)).length }
+}
+
+// --- artifacts: what a session touched, and quarantining it -----------------
+//
+// "Produced files" is derived from the durable session log alone: the log is the
+// only record that outlives a closed Session (the host's own observation state
+// lives in a plugin-local WeakMap and dies with the process, and the
+// `workspace/changes` summaries live in a temporary directory that disposal
+// removes). Classification rests on one invariant of the default
+// fs-observation-policy: `write` may not overwrite a file that was not read
+// first, and `edit` requires a prior read. So a write whose path has no earlier
+// successful read CREATED the file; anything else already existed.
+//
+// Nothing here deletes. Files are moved into a timestamped quarantine directory
+// under $DSH_HOME, keeping their path relative to the session's working
+// directory, so a wrong call is recoverable.
+
+const QUARANTINE_PREFIX = 'purge-quarantine'
+const MAX_LISTED = 500
+/**
+ * How many distinct paths one scan will resolve. Every path costs a realpath,
+ * and a session that walked a large tree can name tens of thousands of them;
+ * the dialog would sit on "scanning" for as long as they take. Past this the
+ * plan reports `truncated`, which the dialog already surfaces.
+ */
+const MAX_SCANNED = 2000
+/** How many path resolutions run at once: enough to hide the threadpool round trip, few enough to stay polite. */
+const RESOLVE_CONCURRENCY = 16
+/** How many directories the folder picker lists before saying there are more. */
+const MAX_BROWSE_ENTRIES = 500
+/** How long the OS chooser may stay open before the request gives up on it. */
+const PICK_TIMEOUT_MS = 5 * 60 * 1000
+/** How long a shell helper (the recycle-bin script) may run before giving up. */
+const SHELL_TIMEOUT_MS = 5 * 60 * 1000
+
+/** Run a program and collect its output, leaving the meaning of the exit to the caller. */
+function runExecutable(program, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(program, args, { windowsHide: true })
+    let out = ''
+    let err = ''
+    let settled = false
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      fn(value)
+    }
+    const timer = setTimeout(() => {
+      try { child.kill() } catch { /* already gone */ }
+      finish(reject, new HttpError(504, 'timeout', 'Tempo esgotado aguardando o diálogo do sistema'))
+    }, timeoutMs)
+
+    child.stdout.on('data', (chunk) => { out += chunk.toString('utf8') })
+    child.stderr.on('data', (chunk) => { err += chunk.toString('utf8') })
+    child.on('error', (error) => {
+      finish(reject, new HttpError(500, 'spawn', `Não foi possível iniciar ${path.basename(program)}: ${String((error && error.message) || error)}`))
+    })
+    child.on('close', (code) => finish(resolve, { code, stdout: out, stderr: err }))
+  })
+}
+
+/** Argument keys carrying the target path, per writing tool. */
+const WRITE_TOOL_PATHS = {
+  write: ['file_path', 'path'],
+  edit: ['file_path', 'path'],
+  str_replace_editor: ['path', 'file_path'],
+  create_file: ['file_path', 'path'],
+}
+
+/** Argument keys carrying the target path, per reading tool. */
+const READ_TOOL_PATHS = {
+  read: ['file_path', 'path'],
+  read_file: ['file_path', 'path'],
+}
+
+/**
+ * Resolve the target path one tool call names.
+ * @param name - tool name.
+ * @param argumentsJson - the model's raw argument JSON.
+ * @param cwd - the session's recorded working directory, for relative paths.
+ * @returns the absolute path and whether the tool writes, or undefined.
+ */
+function toolTarget(name, argumentsJson, cwd) {
+  const writes = Object.prototype.hasOwnProperty.call(WRITE_TOOL_PATHS, name)
+  const keys = writes ? WRITE_TOOL_PATHS[name] : READ_TOOL_PATHS[name]
+  if (keys === undefined) return undefined
+  let args
+  try {
+    args = JSON.parse(typeof argumentsJson === 'string' ? argumentsJson : '')
+  } catch {
+    return undefined
+  }
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return undefined
+  const raw = keys.map((key) => args[key]).find((value) => typeof value === 'string' && value.trim() !== '')
+  if (raw === undefined) return undefined
+  let absolute
+  if (path.isAbsolute(raw)) absolute = raw
+  else if (cwd === undefined) return undefined
+  else absolute = path.resolve(cwd, raw)
+  return { path: absolute, writes }
+}
+
+/** Read a stored session's events through the persistence seam. */
+async function readSessionEvents(ctx, sessionId) {
+  const sp = ctx.get('sessionPersistence')
+  if (!sp || typeof sp.open !== 'function') {
+    return { events: [], warning: 'Serviço de persistência indisponível; não foi possível ler o log da sessão' }
+  }
+  let handle = null
+  try {
+    handle = await sp.open(sessionId, 'read')
+    const result = await handle.read()
+    const events = Array.isArray(result && result.events) ? result.events : []
+    return { events, warning: undefined }
+  } catch (error) {
+    return { events: [], warning: `Falha ao ler o log da sessão: ${String((error && error.message) || error)}` }
+  } finally {
+    try {
+      if (handle && typeof handle.close === 'function') await handle.close()
+    } catch {
+      // a close failure must not change the plan
+    }
+  }
+}
+
+/**
+ * Identity of one path for "have we seen this file before?" purposes. The real
+ * path when it resolves, so a symlink alias and its target count as the same
+ * file; otherwise a case-folded resolved path on Windows, whose filesystem does
+ * not distinguish `Foo.md` from `foo.md`. Comparing spellings instead would let
+ * a write through an alias look like a creation.
+ * @param absolute - the path a tool call named.
+ * @param cache - optional per-scan memo; without it the resolution cost scales
+ *   with log length rather than with the number of distinct files.
+ * @returns a stable key for the file, not for the spelling.
+ */
+async function identityKey(absolute, cache) {
+  if (cache !== undefined) {
+    const hit = cache.get(absolute)
+    if (hit !== undefined) return hit
+  }
+  let key
+  try {
+    key = await realpathNative(absolute)
+  } catch {
+    const resolved = path.resolve(absolute)
+    key = process.platform === 'win32' ? resolved.toLowerCase() : resolved
+  }
+  if (cache !== undefined) cache.set(absolute, key)
+  return key
+}
+
+/**
+ * Every path this session's writing tools touched, split by whether the session
+ * created it or found it already there.
+ * @param events - stored session events, in order.
+ * @param cwd - the session's recorded working directory.
+ * @param cache - optional per-scan memo for path resolution, shared across calls.
+ * @returns `{ created, modified }`, keyed by file identity, each row `{ path, identity, ops }`.
+ */
+async function collectSessionPaths(events, cwd, cache) {
+  const pending = new Map()
+  const read = new Set()
+  const created = new Map()
+  const modified = new Map()
+  const memo = cache !== undefined ? cache : new Map()
+
+  // Resolve every distinct path the log names first, together. A long session
+  // names the same handful of files thousands of times, so awaiting per call
+  // would buy one threadpool round trip per mention; this buys one per file.
+  const named = new Set()
+  let overflow = false
+  for (const event of events) {
+    const data = event && event.data
+    if (!data || typeof data !== 'object' || event.type !== 'tool/call') continue
+    const target = toolTarget(typeof data.name === 'string' ? data.name : '', data.arguments, cwd)
+    if (target === undefined) continue
+    if (named.size >= MAX_SCANNED && !named.has(target.path)) {
+      overflow = true
+      break
+    }
+    named.add(target.path)
+  }
+  await runWithConcurrency([...named], RESOLVE_CONCURRENCY, async (absolute) => {
+    await identityKey(absolute, memo)
+  })
+
+  const commit = (call) => {
+    // A file the session created and later edited stays "created": one identity
+    // must never sit in both buckets, or a scope=all run would target it twice
+    // and report a spurious failure for the second attempt.
+    const alreadyCreated = created.get(call.identity)
+    if (alreadyCreated !== undefined) {
+      alreadyCreated.ops += 1
+      return
+    }
+    const bucket = call.existedBefore ? modified : created
+    const prior = bucket.get(call.identity)
+    if (prior !== undefined) prior.ops += 1
+    else bucket.set(call.identity, { path: call.path, identity: call.identity, ops: 1 })
+  }
+
+  for (const event of events) {
+    const data = event && event.data
+    if (!data || typeof data !== 'object') continue
+
+    if (event.type === 'tool/call') {
+      const name = typeof data.name === 'string' ? data.name : ''
+      const target = toolTarget(name, data.arguments, cwd)
+      // Existence is decided at call time, against the reads that already
+      // succeeded - the policy's own ordering - and on identity, so an alias of
+      // a file the session read is still an edit.
+      if (target !== undefined) {
+        const identity = await identityKey(target.path, memo)
+        pending.set(data.callId, {
+          path: target.path,
+          identity,
+          writes: target.writes,
+          existedBefore: read.has(identity),
+        })
+      }
+      continue
+    }
+
+    if (event.type !== 'tool/result') continue
+    const message = data.message
+    const callId = message && typeof message.toolCallId === 'string' ? message.toolCallId : undefined
+    if (callId === undefined) continue
+    const call = pending.get(callId)
+    if (call === undefined) continue
+    pending.delete(callId)
+    if (data.error !== undefined || (message && message.isError === true)) continue
+    if (call.writes) commit(call)
+    else read.add(call.identity)
+  }
+
+  return { named: named.size, overflow, created, modified }
+}
+
+/**
+ * Whether `child` is strictly inside `parent`, comparing real paths. Folded on
+ * Windows, where the filesystem ignores case: a realpath does not normalise the
+ * case of a prefix that still matches a differently-spelled spelling.
+ */
+function insidePath(parent, child) {
+  if (parent === child) return false
+  const fold = (value) => (process.platform === 'win32' ? value.toLowerCase() : value)
+  const base = fold(parent)
+  const prefix = base.endsWith(path.sep) ? base : base + path.sep
+  return fold(child).startsWith(prefix)
+}
+
+/**
+ * Is this directory inside a git working tree? A `.git` entry marks the root —
+ * a directory in a normal clone, a file in a worktree or a submodule.
+ *
+ * The walk memoises per directory: one plan can span hundreds of files that share
+ * a handful of folders, and each miss would otherwise stat every level again.
+ */
+async function isInsideGitRepo(directory, cache) {
+  let current = path.resolve(directory)
+  const walked = []
+  for (;;) {
+    if (cache.has(current)) {
+      const verdict = cache.get(current)
+      for (const dir of walked) cache.set(dir, verdict)
+      return verdict
+    }
+    walked.push(current)
+    try {
+      const marker = await fsp.stat(path.join(current, '.git'))
+      if (marker.isDirectory() || marker.isFile()) {
+        for (const dir of walked) cache.set(dir, true)
+        return true
+      }
+    } catch {
+      // no .git here; keep walking up
+    }
+    const parent = path.dirname(current)
+    if (parent === current) {
+      for (const dir of walked) cache.set(dir, false)
+      return false
+    }
+    current = parent
+  }
+}
+
+/**
+ * Keep only the paths that may actually be moved: an existing regular file whose
+ * real path is strictly inside the session's working directory and outside the
+ * DSH home. Every rejection carries its reason.
+ * @param rows - candidate rows `{ path, ops }`.
+ * @param cwd - the session's recorded working directory.
+ * @param home - resolved DSH home.
+ * @param options - `{ skipGit }`: also refuse files inside a git working tree.
+ * @returns `{ allowed, refused }`.
+ */
+async function classifyPaths(rows, cwd, home, options) {
+  const allowed = []
+  const refused = []
+  const skipGit = options !== undefined && options !== null && options.skipGit === true
+  const gitCache = new Map()
+  const list = [...rows.values()]
+  if (cwd === undefined) {
+    for (const row of list) refused.push({ path: row.path, reason: 'A sessão não registrou um diretório de trabalho; não é possível localizar com segurança' })
+    return { allowed, refused }
+  }
+  let realCwd
+  try {
+    realCwd = await fsp.realpath(cwd)
+  } catch {
+    for (const row of list) refused.push({ path: row.path, reason: 'O diretório de trabalho da sessão não existe mais; não é possível verificar a origem' })
+    return { allowed, refused }
+  }
+  let realHome = home
+  try {
+    realHome = await fsp.realpath(home)
+  } catch {
+    // an absent home cannot contain anything that exists
+  }
+  // Resolve each row's stat and real path together rather than one after another:
+  // a long session can list hundreds of files, and awaiting them serially turns
+  // one threadpool round trip into hundreds. `runWithConcurrency` keeps the order.
+  const verdicts = await runWithConcurrency(list, RESOLVE_CONCURRENCY, async (row) => {
+    let info
+    try {
+      info = await fsp.stat(row.path)
+    } catch {
+      return { refuse: { path: row.path, reason: 'O arquivo não existe mais' } }
+    }
+    if (!info.isFile()) return { refuse: { path: row.path, reason: 'Não é um arquivo comum; ignorado' } }
+    let real
+    try {
+      real = await fsp.realpath(row.path)
+    } catch {
+      return { refuse: { path: row.path, reason: 'Não foi possível resolver o caminho real; ignorado' } }
+    }
+    if (!insidePath(realCwd, real)) {
+      return { refuse: { path: row.path, reason: 'Fora do diretório de trabalho desta conversa; ignorado' } }
+    }
+    if (insidePath(realHome, real)) {
+      return { refuse: { path: row.path, reason: 'Dentro do diretório de dados do DSH; ignorado' } }
+    }
+    if (skipGit && await isInsideGitRepo(path.dirname(real), gitCache)) {
+      return { refuse: { path: row.path, reason: 'Dentro de um repositório git; ignorado' } }
+    }
+    return { allow: { path: real, displayPath: row.path, ops: row.ops, bytes: info.size, mtime: info.mtimeMs } }
+  })
+  for (const verdict of verdicts) {
+    if (verdict.allow !== undefined) allowed.push(verdict.allow)
+    else refused.push(verdict.refuse)
+  }
+  return { allowed, refused }
+}
+
+/**
+ * Build the artifact plan for one session.
+ * @param ctx - host plugin context.
+ * @param sessionId - validated session id.
+ * @returns `{ cwd, created, modified, refused, truncated, warnings }`.
+ */
+async function planArtifacts(ctx, sessionId, cache, options) {
+  const home = dshHome()
+  const warnings = []
+  const sp = ctx.get('sessionPersistence')
+  let cwd
+  if (sp && typeof sp.stat === 'function') {
+    try {
+      const snapshot = await sp.stat(sessionId)
+      let header = null
+      if (snapshot !== null && typeof snapshot === 'object') {
+        header = snapshot.header !== null && typeof snapshot.header === 'object' ? snapshot.header : snapshot
+      }
+      if (header && typeof header.cwd === 'string' && header.cwd !== '') cwd = header.cwd
+    } catch (error) {
+      warnings.push(`Nenhum registro de armazenamento encontrado para a sessão: ${String((error && error.message) || error)}`)
+    }
+  }
+  const { events, warning } = await readSessionEvents(ctx, sessionId)
+  if (warning !== undefined) warnings.push(warning)
+  const scan = await collectSessionPaths(events, cwd, cache)
+  const { created, modified } = scan
+  const createdPlan = await classifyPaths(created, cwd, home, options)
+  const modifiedPlan = await classifyPaths(modified, cwd, home, options)
+  const refused = [...createdPlan.refused, ...modifiedPlan.refused]
+  return {
+    // Stamped so a caller handing this plan back cannot smuggle in another
+    // session's list: runQuarantine refuses a plan that does not belong here.
+    sessionId,
+    cwd,
+    created: createdPlan.allowed.slice(0, MAX_LISTED),
+    modified: modifiedPlan.allowed.slice(0, MAX_LISTED),
+    refused: refused.slice(0, MAX_LISTED),
+    truncated: scan.overflow
+      || createdPlan.allowed.length > MAX_LISTED
+      || modifiedPlan.allowed.length > MAX_LISTED
+      || refused.length > MAX_LISTED,
+    warnings,
+  }
+}
+
+/**
+ * Claim a quarantine directory under the DSH home. The name carries second
+ * resolution only, so two deletes can land on the same name; an exclusive mkdir
+ * (never `recursive: true`, which would happily reuse an existing tree) decides
+ * the winner and the loser retries with a suffix. Two runs therefore can never
+ * share a tree, which is what stops one run's file from overwriting another's.
+ * @param home - resolved DSH home.
+ * @returns the claimed directory, or undefined when none could be claimed.
+ */
+async function claimQuarantineDirectory(home) {
+  // A fresh home has no quarantine root yet; creating it is the only write this
+  // side does outside the quarantine tree, and it keeps a missing home from
+  // turning into a silent "cannot claim" on the very first delete.
+  try {
+    await fsp.mkdir(home, { recursive: true })
+  } catch {
+    return undefined
+  }
+  const base = `${QUARANTINE_PREFIX}-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const candidate = path.join(home, attempt === 0 ? base : `${base}-${attempt}`)
+    try {
+      await fsp.mkdir(candidate, { recursive: false })
+      return candidate
+    } catch (error) {
+      if (error && error.code === 'EEXIST') continue
+      return undefined
+    }
+  }
+  return undefined
+}
+
+/** Whether a path exists, without throwing. */
+async function pathExists(target) {
+  try {
+    await fsp.access(target)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * A destination inside the quarantine tree that does not already exist. The
+ * move itself must never overwrite: a quarantine that silently replaced an
+ * earlier copy would destroy the only surviving copy of the file it replaced.
+ * @param directory - claimed quarantine directory.
+ * @param relative - path relative to the session's working directory.
+ * @returns a free absolute path, or undefined when every name was taken.
+ */
+async function freeDestination(directory, relative) {
+  const first = path.join(directory, relative)
+  if (!(await pathExists(first))) return first
+  const dir = path.dirname(first)
+  const ext = path.extname(first)
+  const stem = path.basename(first, ext)
+  for (let n = 1; n < 10000; n += 1) {
+    const candidate = path.join(dir, `${stem}-${n}${ext}`)
+    if (!(await pathExists(candidate))) return candidate
+  }
+  return undefined
+}
+
+/**
+ * Move the chosen files into a timestamped quarantine directory under the DSH
+ * home, preserving each path relative to the session's working directory. Files
+ * are moved, never removed, and an existing quarantine entry is never replaced,
+ * so a wrong call is always recoverable by hand.
+ *
+ * Every step is asynchronous on purpose: a cross-device move copies, and a
+ * synchronous copy inside the request handler would freeze the event loop, which
+ * means every other session's traffic stalls behind one large quarantine.
+ *
+ * @param targets - absolute file paths to move.
+ * @param cwd - the session's recorded working directory.
+ * @param home - resolved DSH home.
+ * @returns `{ directory, moved, failed }`.
+ */
+async function quarantineFiles(targets, cwd, home) {
+  const moved = []
+  const failed = []
+  if (targets.length === 0) return { directory: null, moved, failed }
+
+  const directory = await claimQuarantineDirectory(home)
+  if (directory === undefined) {
+    for (const target of targets) failed.push({ path: target, error: 'Não foi possível criar o diretório de quarentena' })
+    return { directory: null, moved, failed }
+  }
+
+  let realCwd = cwd
+  if (typeof cwd === 'string') {
+    try {
+      realCwd = await fsp.realpath(cwd)
+    } catch {
+      // keep the recorded spelling; classifyPaths already proved containment
+    }
+  }
+  for (const target of targets) {
+    let relative = path.basename(target)
+    if (typeof realCwd === 'string') {
+      const candidate = path.relative(realCwd, target)
+      if (candidate !== '' && !candidate.startsWith('..') && !path.isAbsolute(candidate)) relative = candidate
+    }
+    try {
+      await fsp.mkdir(path.dirname(path.join(directory, relative)), { recursive: true })
+      const destination = await freeDestination(directory, relative)
+      if (destination === undefined) {
+        failed.push({ path: target, error: 'Nenhum nome de destino disponível no diretório de quarentena' })
+        continue
+      }
+      try {
+        await fsp.rename(target, destination)
+      } catch {
+        // A cross-device rename fails; fall back to copy-then-remove. `COPYFILE_EXCL`
+        // keeps the copy from replacing anything that appeared in between.
+        await fsp.copyFile(target, destination, fs.constants.COPYFILE_EXCL)
+        await fsp.rm(target, { force: true })
+      }
+      moved.push({ from: target, to: destination })
+    } catch (error) {
+      failed.push({ path: target, error: String((error && error.message) || error) })
+    }
+  }
+  return { directory, moved, failed }
+}
+
+/**
+ * The files one plan actually offered. The per-file delete button sends back a
+ * path from this list, and the route refuses anything else: a request cannot
+ * name a file the user was never shown.
+ *
+ * @param plan - the artifact plan this plugin produced for a session.
+ * @returns every listed path, created and modified alike.
+ */
+function artifactCandidates(plan) {
+  const out = []
+  for (const group of [plan.created, plan.modified]) {
+    if (!Array.isArray(group)) continue
+    for (const row of group) {
+      if (row !== null && row !== undefined && typeof row.path === 'string') out.push(row.path)
+    }
+  }
+  return out
+}
+
+/**
+ * The path a per-file delete may touch: one the plan listed, nothing else.
+ * Without this the button would be a general-purpose delete primitive reachable
+ * from the page.
+ *
+ * @param plan - the artifact plan for the session.
+ * @param target - the path the page asked for.
+ * @returns the resolved path, ready to unlink.
+ */
+function assertListedPath(plan, target) {
+  const resolved = path.resolve(target)
+  const listed = artifactCandidates(plan).some((candidate) => path.resolve(candidate) === resolved)
+  if (!listed) throw new HttpError(403, 'not-listed', 'O arquivo não está na lista de produzidos desta conversa')
+  return resolved
+}
+
+/**
+ * Delete one produced file. The destination is the user's call, and the dialog
+ * passes the same preference that governs a conversation delete: to the system
+ * trash, or outright.
+ *
+ * @param target - absolute path of the file.
+ * @param recycle - true to send it to the system recycle bin.
+ * @returns `{ recycled }` describing where it went.
+ */
+async function removeOneFile(target, recycle) {
+  const resolved = path.resolve(target)
+  let info
+  try {
+    info = await fsp.lstat(resolved)
+  } catch (error) {
+    throw new HttpError(404, 'missing', `O arquivo não existe mais: ${String((error && error.message) || error)}`)
+  }
+  if (!info.isFile()) throw new HttpError(400, 'not-a-file', 'Só é possível excluir arquivos comuns')
+  if (recycle === true) {
+    const ok = await sendToRecycleBin([resolved])
+    if (!ok) throw new HttpError(500, 'recycle', 'Falha ao mover para a lixeira')
+    return { recycled: true }
+  }
+  try {
+    await fsp.unlink(resolved)
+  } catch (error) {
+    throw new HttpError(500, 'unlink', `Falha ao excluir: ${String((error && error.message) || error)}`)
+  }
+  return { recycled: false }
+}
+
+/**
+ * Quarantine the files one request selected. The candidate set is recomputed
+ * here from the session log and the request's paths are intersected with it, so
+ * a tampered request cannot move anything the user was not shown.
+ * @param ctx - host plugin context.
+ * @param sessionId - validated session id.
+ * @param request - `{ scope, paths }` from the client; undefined asks for none.
+ * @returns the outcome, or null when the request asked for no quarantine.
+ */
+async function runQuarantine(ctx, sessionId, request, knownPlan) {
+  if (request === undefined || request === null || typeof request !== 'object') return null
+  // Validated here as well as at the route, because `internals` exposes this
+  // function and a direct caller must not be able to skip the check.
+  if (!SESSION_ID_RE.test(sessionId)) throw new HttpError(400, 'invalid', 'ID de sessão inválido')
+  const scope = request.scope === 'all' ? 'all' : 'created'
+  // The same flag the dialog was built with, so a derived set cannot contain a
+  // file the listing refused to show.
+  const skipGit = request.skipGit === true
+  // Re-deriving the plan is the expensive half of a delete; a caller that already
+  // holds it for this session hands it over instead of paying for it twice.
+  const plan = knownPlan === undefined || knownPlan === null
+    ? await planArtifacts(ctx, sessionId, undefined, { skipGit })
+    : knownPlan
+  // A handed-in plan must be this session's plan. The route always derives it
+  // from the same id, but `internals` exposes this function, and a future caller
+  // passing its neighbour's plan would move files the user never saw.
+  if (plan.sessionId !== sessionId) throw new HttpError(400, 'invalid', 'O plano não pertence a esta sessão')
+  const candidates = scope === 'all' ? [...plan.created, ...plan.modified] : [...plan.created]
+  const allowed = new Set(candidates.map((row) => row.path))
+  const requested = Array.isArray(request.paths) ? request.paths : null
+  const requestedStrings = requested === null ? null : new Set(requested.filter((value) => typeof value === 'string'))
+  const targets = requested === null
+    ? [...allowed]
+    : [...requestedStrings].filter((value) => allowed.has(value))
+  // Resolve the configured save path before moving a single file: a bad path must
+  // stop the request, not send the files somewhere unintended.
+  const rootInfo = await resolveQuarantineRoot(request.root, plan.cwd)
+  if (rootInfo.error !== undefined) throw new HttpError(400, 'invalid', rootInfo.error)
+  const root = rootInfo.root
+  const outcome = await quarantineFiles(targets, plan.cwd, root)
+  return {
+    scope,
+    directory: outcome.moved.length > 0 ? outcome.directory : null,
+    root,
+    moved: outcome.moved,
+    failed: outcome.failed,
+    candidates: allowed.size,
+    selected: targets.length,
+    dropped: requestedStrings === null ? 0 : requestedStrings.size - targets.length,
+  }
+}
+
+/**
+ * Decide which directory the timestamped quarantine folder is created under. An
+ * empty request means the DSH home, which is what every earlier version did.
+ * @param requested - the directory the client asked for, if any.
+ * @param cwd - the session's working directory, used to refuse a "quarantine"
+ *   that would only shuffle the files around inside the tree they came from.
+ * @returns `{ root }` or `{ error }`.
+ */
+async function resolveQuarantineRoot(requested, cwd) {
+  const home = dshHome()
+  if (requested === undefined || requested === null || requested === '') return { root: home }
+  if (typeof requested !== 'string') return { error: 'O caminho de salvamento deve ser uma string' }
+  if (requested.length > 4096) return { error: 'Caminho de salvamento longo demais' }
+  if (!path.isAbsolute(requested)) return { error: 'O caminho de salvamento deve ser absoluto' }
+
+  let real
+  try {
+    real = await fsp.realpath(requested)
+  } catch {
+    return { error: `O caminho de salvamento não existe: ${requested}` }
+  }
+  let info
+  try {
+    info = await fsp.stat(real)
+  } catch {
+    return { error: `Não foi possível ler o caminho de salvamento: ${requested}` }
+  }
+  if (!info.isDirectory()) return { error: 'O caminho de salvamento não é um diretório' }
+
+  // The sessions store belongs to DSH; filling it with quarantined files would
+  // drop them back into the one tree the delete pipeline sweeps.
+  const sessionsRoot = path.join(home, 'sessions')
+  if (real === sessionsRoot || insidePath(sessionsRoot, real)) {
+    return { error: 'A quarentena não pode ficar dentro do diretório de armazenamento de sessões' }
+  }
+  if (typeof cwd === 'string') {
+    let realCwd
+    try {
+      realCwd = await fsp.realpath(cwd)
+    } catch {
+      realCwd = undefined
+    }
+    if (realCwd !== undefined && (real === realCwd || insidePath(realCwd, real))) {
+      return { error: 'A quarentena não pode ficar dentro do diretório de trabalho da sessão' }
+    }
+  }
+  return { root: real }
+}
+
+/** The drive letters Windows exposes, skipping the ones that cannot be read. */
+async function listDriveRoots() {
+  if (process.platform !== 'win32') return []
+  const roots = []
+  for (let code = 65; code <= 90; code += 1) {
+    const drive = `${String.fromCharCode(code)}:\\`
+    try {
+      await fsp.access(drive)
+      roots.push({ name: drive, path: drive })
+    } catch {
+      // absent or unreadable: not offered
+    }
+  }
+  return roots
+}
+
+/**
+ * One directory listing for the folder picker. Directories only: the picker
+ * chooses where a folder is created, so files would be noise.
+ * @param target - absolute directory to list; the DSH home when omitted.
+ */
+async function listDirectories(target) {
+  const home = dshHome()
+  const start = target === undefined || target === null || target === '' ? home : target
+  if (typeof start !== 'string') throw new HttpError(400, 'invalid', 'O caminho deve ser uma string')
+  if (!path.isAbsolute(start)) throw new HttpError(400, 'invalid', 'O caminho deve ser absoluto')
+
+  let real
+  try {
+    real = await fsp.realpath(start)
+  } catch {
+    throw new HttpError(400, 'invalid', `Diretório inexistente: ${start}`)
+  }
+  let entries
+  try {
+    entries = await fsp.readdir(real, { withFileTypes: true })
+  } catch (error) {
+    throw new HttpError(400, 'invalid', `Não foi possível ler o diretório: ${String((error && error.message) || error)}`)
+  }
+
+  const directories = []
+  for (const entry of entries) {
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
+    const full = path.join(real, entry.name)
+    try {
+      // `stat` follows a link, so a shortcut to a folder is still offered.
+      const info = await fsp.stat(full)
+      if (!info.isDirectory()) continue
+    } catch {
+      continue
+    }
+    directories.push({ name: entry.name, path: full })
+  }
+  directories.sort((a, b) => a.name.localeCompare(b.name))
+
+  const parent = real === path.parse(real).root ? null : path.dirname(real)
+  return {
+    path: real,
+    parent,
+    entries: directories.slice(0, MAX_BROWSE_ENTRIES),
+    truncated: directories.length > MAX_BROWSE_ENTRIES,
+    // At a drive root, offer the other drives so Windows users are not stranded.
+    roots: parent === null ? await listDriveRoots() : [],
+    defaultRoot: home,
+  }
+}
+
+/**
+ * Run one PowerShell invocation and resolve its trimmed stdout.
+ *
+ * The script is passed as a file, never on stdin: `-Command -` reads stdin with
+ * the console code page, and a non-ASCII byte in the script (the Chinese dialog
+ * description, for one) silently killed the whole run instead of erroring.
+ */
+function runPowershell(args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('powershell.exe', args, {
+      windowsHide: true,
+    })
+    let out = ''
+    let err = ''
+    let settled = false
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      fn(value)
+    }
+    const timer = setTimeout(() => {
+      try { child.kill() } catch { /* already gone */ }
+      finish(reject, new HttpError(504, 'timeout', 'Tempo esgotado aguardando o diálogo do sistema'))
+    }, timeoutMs)
+
+    child.stdout.on('data', (chunk) => { out += chunk.toString('utf8') })
+    child.stderr.on('data', (chunk) => { err += chunk.toString('utf8') })
+    child.on('error', (error) => {
+      finish(reject, new HttpError(500, 'spawn', `Não foi possível abrir o diálogo do sistema: ${String((error && error.message) || error)}`))
+    })
+    child.on('close', (code) => {
+      if (code !== 0) {
+        finish(reject, new HttpError(500, 'shell', `O diálogo do sistema encerrou com erro (${code}): ${err.trim().slice(0, 300)}`))
+        return
+      }
+      finish(resolve, out.trim())
+    })
+  })
+}
+
+/**
+ * Open a directory in the operating system's file manager. The child is detached
+ * and unreferenced so the HTTP response returns at once and the window lives on
+ * its own; `explorer.exe` reports a non-zero exit even when it succeeds, so its
+ * status is deliberately ignored.
+ */
+function revealDirectory(directory) {
+  const opener = process.platform === 'win32'
+    ? { program: 'explorer.exe', args: [directory] }
+    : process.platform === 'darwin'
+      ? { program: 'open', args: [directory] }
+      : { program: 'xdg-open', args: [directory] }
+  const child = spawn(opener.program, opener.args, { detached: true, stdio: 'ignore', windowsHide: false })
+  // Without this listener a failed spawn (explorer missing, blocked by security
+  // software) surfaces as an unhandled `error` event and takes the host down.
+  child.on('error', () => {})
+  child.unref()
+}
+
+/**
+ * Ask the host for a directory.
+ *
+ * DSH mounts `ctx.directoryPicker` (`@deepseek-ai/dsh-host-directory-picker-auto`),
+ * whose capability names the interaction this deployment supports: a native
+ * deployment opens one OS chooser, a browse deployment serves a listing the page
+ * draws itself. Consumers are meant to switch on `capability().kind`.
+ *
+ * This plugin used to compile its own C# chooser and fall back to PowerShell. That
+ * was a reimplementation of something the host already ships, it could not follow a
+ * remote deployment, and it needed a compiler on the machine at first use.
+ *
+ * @returns `{ cancelled, path }` from a native chooser, else `{ browse: true }` or
+ *          `{ unsupported: true }` so the page falls back to its own picker.
+ */
+async function pickFolder(ctx) {
+  const picker = ctx !== null && ctx !== undefined && typeof ctx.get === 'function'
+    ? ctx.get('directoryPicker')
+    : undefined
+  if (picker === null || picker === undefined || typeof picker.capability !== 'function') {
+    return { unsupported: true }
+  }
+  let capability
+  try {
+    capability = picker.capability()
+  } catch {
+    return { unsupported: true }
+  }
+  if (capability === null || capability === undefined) return { unsupported: true }
+  if (capability.kind !== 'native' || typeof capability.pick !== 'function') return { browse: true }
+  // `pick(signal)` is mandatory: the host implementation begins with
+  // `if (signal.aborted) throw …`, so calling it bare throws a TypeError that
+  // reads like an unrelated failure ("… reading 'aborted'"). The timeout matches
+  // the one the previous PowerShell dialog used: a dialog nobody answers must not
+  // hold the request forever.
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), PICK_TIMEOUT_MS)
+  let picked
+  try {
+    picked = await capability.pick(controller.signal)
+  } finally {
+    clearTimeout(timer)
+  }
+  const chosen = typeof picked === 'string' && picked !== '' ? picked : null
+  if (chosen === null) return { cancelled: true, path: null }
+  const resolved = path.resolve(chosen)
+  let info
+  try {
+    info = await fsp.stat(resolved)
+  } catch {
+    throw new HttpError(400, 'invalid', 'O diretório selecionado não existe mais')
+  }
+  if (!info.isDirectory()) throw new HttpError(400, 'invalid', 'O item selecionado não é um diretório')
+  return { cancelled: false, path: resolved }
+}
+
+
+// --- http --------------------------------------------------------------------
+
+function isLoopbackAddress(address) {
+  if (typeof address !== 'string' || address.length === 0) return false
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1' || address.startsWith('127.')
+}
+
+function isLocalHostHeader(host) {
+  if (typeof host !== 'string' || host.length === 0) return false
+  const name = host.split(':')[0].replace(/^\[|\]$/g, '').toLowerCase()
+  return name === 'localhost' || name === '127.0.0.1' || name === '::1'
+}
+
+function sendJson(res, status, body) {
+  const payload = JSON.stringify(body)
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(payload),
+  })
+  res.end(payload)
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = ''
+    req.on('data', (chunk) => {
+      data += chunk
+      if (data.length > 1e6) req.destroy()
+    })
+    req.on('end', () => resolve(data))
+    req.on('error', reject)
+    req.on('aborted', () => reject(new Error('aborted')))
+  })
+}
+
+// Destructive local endpoint: loopback socket, loopback Host header, and a
+// same-origin check when the browser sends Origin. Tunneled or LAN clients
+// get 403 before any session data is touched.
+function guard(req, res) {
+  if (!isLoopbackAddress(req.socket && req.socket.remoteAddress)) {
+    sendJson(res, 403, { ok: false, code: 'forbidden', error: 'Apenas conexões locais (loopback)' })
+    return false
+  }
+  const host = req.headers.host
+  if (!isLocalHostHeader(host)) {
+    sendJson(res, 403, { ok: false, code: 'forbidden', error: 'Cabeçalho Host inesperado' })
+    return false
+  }
+  const origin = req.headers.origin
+  if (typeof origin === 'string' && origin.length > 0) {
+    let originHost = null
+    try {
+      originHost = new URL(origin).host
+    } catch {
+      originHost = null
+    }
+    if (originHost !== host) {
+      sendJson(res, 403, { ok: false, code: 'forbidden', error: 'Requisição de origem cruzada' })
+      return false
+    }
+  }
+  return true
+}
+
+// --- plugin ------------------------------------------------------------------
+
+export function apply(ctx) {
+  warmCompiledHelpers()
+
+  const registerRoutes = (webServer, fiber) => {
+    // Read-only scan: the dialog shows what a delete would move, before it does.
+    fiber.effect(() => webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/artifacts`,
+      handler: async (req, res) => {
+        if (!guard(req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method', error: 'Apenas POST' })
+          return
+        }
+        let body = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) body = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'Corpo JSON malformado' })
+          return
+        }
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+        if (!sessionId) {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'sessionId é obrigatório' })
+          return
+        }
+        try {
+          if (!SESSION_ID_RE.test(sessionId)) throw new HttpError(400, 'invalid', 'ID de sessão inválido')
+          const plan = await planArtifacts(ctx, sessionId, undefined, { skipGit: body.skipGit === true })
+          // A bad save path is reported alongside the plan rather than replacing
+          // it: the dialog can still show the files while saying where they cannot go.
+          const rootInfo = await resolveQuarantineRoot(body.root, plan.cwd)
+          sendJson(res, 200, {
+            ok: true,
+            sessionId,
+            ...plan,
+            defaultRoot: dshHome(),
+            quarantineRoot: rootInfo.error === undefined ? rootInfo.root : null,
+            rootError: rootInfo.error === undefined ? null : rootInfo.error,
+          })
+        } catch (error) {
+          const status = error instanceof HttpError ? error.status : 500
+          const code = error instanceof HttpError ? error.code : 'internal'
+          sendJson(res, status, { ok: false, code, error: String((error && error.message) || error) })
+        }
+      },
+    }))
+
+    // Delete ONE produced file from the dialog. The path must be one the scan
+    // listed, so this cannot become a general-purpose delete primitive.
+    fiber.effect(() => webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/delete-file`,
+      handler: async (req, res) => {
+        if (!guard(req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method', error: 'Apenas POST' })
+          return
+        }
+        let body = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) body = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'Corpo JSON malformado' })
+          return
+        }
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+        const target = typeof body.path === 'string' ? body.path.trim() : ''
+        try {
+          if (sessionId === '') throw new HttpError(400, 'invalid', 'sessionId é obrigatório')
+          if (target === '') throw new HttpError(400, 'invalid', 'path é obrigatório')
+          if (!SESSION_ID_RE.test(sessionId)) throw new HttpError(400, 'invalid', 'ID de sessão inválido')
+          const plan = await planArtifacts(ctx, sessionId, undefined, {})
+          const resolved = assertListedPath(plan, target)
+          const result = await removeOneFile(resolved, body.recycle === true)
+          sendJson(res, 200, { ok: true, ...result })
+        } catch (error) {
+          const status = error instanceof HttpError ? error.status : 500
+          const code = error instanceof HttpError ? error.code : 'internal'
+          sendJson(res, status, { ok: false, code, error: String((error && error.message) || error) })
+        }
+      },
+    }))
+
+    // The real Windows folder dialog, raised on the user's behalf. Browsers cannot
+    // hand a page a filesystem path, but this process is local, so it can.
+    fiber.effect(() => webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/pick`,
+      handler: async (req, res) => {
+        if (!guard(req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method', error: 'Apenas POST' })
+          return
+        }
+        try {
+          const picked = await pickFolder(ctx)
+          if (picked.unsupported === true) {
+            sendJson(res, 200, { ok: false, code: 'unsupported', error: 'O host não tem o serviço directoryPicker' })
+            return
+          }
+          if (picked.browse === true) {
+            sendJson(res, 200, { ok: false, code: 'browse', error: 'Host no modo navegador; use o seletor dentro da página' })
+            return
+          }
+          sendJson(res, 200, { ok: true, ...picked })
+        } catch (error) {
+          const status = error instanceof HttpError ? error.status : 500
+          const code = error instanceof HttpError ? error.code : 'internal'
+          sendJson(res, status, { ok: false, code, error: String((error && error.message) || error) })
+        }
+      },
+    }))
+
+    // Open a folder in the OS file manager. The path is validated as an existing
+    // directory first: this hands a string to Explorer, so it must never be able
+    // to carry anything but a directory.
+    fiber.effect(() => webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/reveal`,
+      handler: async (req, res) => {
+        if (!guard(req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method', error: 'Apenas POST' })
+          return
+        }
+        let body = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) body = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'Corpo JSON malformado' })
+          return
+        }
+        try {
+          const target = typeof body.path === 'string' ? body.path.trim() : ''
+          if (target === '') throw new HttpError(400, 'invalid', 'path é obrigatório')
+          const resolved = path.resolve(target)
+          let info
+          try {
+            info = await fsp.stat(resolved)
+          } catch {
+            throw new HttpError(400, 'invalid', 'Diretório inexistente')
+          }
+          if (!info.isDirectory()) throw new HttpError(400, 'invalid', 'Não é um diretório')
+          revealDirectory(resolved)
+          sendJson(res, 200, { ok: true, path: resolved })
+        } catch (error) {
+          const status = error instanceof HttpError ? error.status : 500
+          const code = error instanceof HttpError ? error.code : 'internal'
+          sendJson(res, status, { ok: false, code, error: String((error && error.message) || error) })
+        }
+      },
+    }))
+
+    // Folder picker for the quarantine save path: directories only, never file
+    // contents, and the same loopback guard as every other route here.
+    fiber.effect(() => webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/browse`,
+      handler: async (req, res) => {
+        if (!guard(req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method', error: 'Apenas POST' })
+          return
+        }
+        let body = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) body = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'Corpo JSON malformado' })
+          return
+        }
+        try {
+          const listing = await listDirectories(body.path)
+          sendJson(res, 200, { ok: true, ...listing })
+        } catch (error) {
+          const status = error instanceof HttpError ? error.status : 500
+          const code = error instanceof HttpError ? error.code : 'internal'
+          sendJson(res, status, { ok: false, code, error: String((error && error.message) || error) })
+        }
+      },
+    }))
+
+    // The subagent sessions behind one conversation. A subagent is a session of
+    // its own, linked only by `parentSession`, so the dialog needs this list
+    // before it can offer anything to tick.
+    fiber.effect(() => webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/children`,
+      handler: async (req, res) => {
+        if (!guard(req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method', error: 'Apenas POST' })
+          return
+        }
+        let body = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) body = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'Corpo JSON malformado' })
+          return
+        }
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+        if (!SESSION_ID_RE.test(sessionId)) {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'ID de sessão inválido' })
+          return
+        }
+        try {
+          const headers = await listSessionHeaders(ctx)
+          sendJson(res, 200, { ok: true, children: describeChildren(headers, sessionId) })
+        } catch (error) {
+          const status = error instanceof HttpError ? error.status : 500
+          const code = error instanceof HttpError ? error.code : 'internal'
+          sendJson(res, status, { ok: false, code, error: String((error && error.message) || error) })
+        }
+      },
+    }))
+    fiber.effect(() => webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/delete`,
+      handler: async (req, res) => {
+        if (!guard(req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method', error: 'Apenas POST' })
+          return
+        }
+        let body = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) body = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'Corpo JSON malformado' })
+          return
+        }
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+        if (!sessionId) {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'sessionId é obrigatório' })
+          return
+        }
+        try {
+          // Validate before touching anything: the quarantine runs first, so an
+          // unchecked id would reach the filesystem ahead of deleteSession's own
+          // guard. `/artifacts` already validates at the same point.
+          if (!SESSION_ID_RE.test(sessionId)) throw new HttpError(400, 'invalid', 'ID de sessão inválido')
+          // Quarantine first: the session log is still there to derive the plan
+          // from, and a partial move leaves the conversation intact to retry.
+          const wantsQuarantine = typeof body.quarantine === 'object' && body.quarantine !== null
+          // The plan handed to the move must honour the same `skipGit` the dialog
+          // listed, or a file the listing refused to show would move anyway.
+          const plan = wantsQuarantine
+            ? await planArtifacts(ctx, sessionId, undefined, { skipGit: body.quarantine.skipGit === true })
+            : null
+          const quarantine = await runQuarantine(ctx, sessionId, body.quarantine, plan)
+          const result = await deleteSession(ctx, sessionId, {
+            recycle: body.recycle !== false,
+            childSessionIds: Array.isArray(body.childSessionIds) ? body.childSessionIds : [],
+          })
+          sendJson(res, 200, quarantine === null ? { ok: true, ...result } : { ok: true, ...result, quarantine })
+        } catch (error) {
+          const status = error instanceof HttpError ? error.status : 500
+          const code = error instanceof HttpError ? error.code : 'internal'
+          sendJson(res, status, { ok: false, code, error: String((error && error.message) || error) })
+        }
+      },
+    }))
+
+    fiber.effect(() => webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/delete-many`,
+      handler: async (req, res) => {
+        if (!guard(req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, code: 'method', error: 'Apenas POST' })
+          return
+        }
+        let body = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) body = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'Corpo JSON malformado' })
+          return
+        }
+        const sessionIds = Array.isArray(body.sessionIds)
+          ? [...new Set(body.sessionIds.filter((id) => typeof id === 'string' && id.trim()).map((id) => id.trim()))]
+          : []
+        if (sessionIds.length === 0) {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: 'sessionIds é obrigatório' })
+          return
+        }
+        if (sessionIds.length > MAX_BATCH) {
+          sendJson(res, 400, { ok: false, code: 'invalid', error: `too many sessions (max ${MAX_BATCH})` })
+          return
+        }
+        // Bounded-concurrency batch: every item runs the same guarded pipeline
+        // (lease retry, directory sweep, workspace accounting); independent
+        // sessions run in parallel and the workspace accounting mutation is
+        // serialized inside deleteSession, so a batch can never interleave two
+        // deletions of the same storage.
+        const results = await deleteSessions(ctx, sessionIds, {
+          recycle: body.recycle !== false,
+          childSessionIds: Array.isArray(body.childSessionIds) ? body.childSessionIds : [],
+        })
+        const deleted = results.filter((item) => item.ok).length
+        sendJson(res, 200, { ok: true, results, deleted, failed: results.length - deleted })
+      },
+    }))
+  }
+
+  const webServer = ctx.get('webServer')
+  if (webServer) {
+    registerRoutes(webServer, ctx)
+  } else {
+    // A terminal-only profile never provides a web surface; register once one
+    // appears instead of waiting on a service that will never arrive.
+    ctx.inject(['webServer'], (sub) => registerRoutes(sub.webServer, sub))
+  }
+}
+
+// Re-exported for the offline test suite, which drives the artifact plan and the
+// quarantine against a scratch tree and a stubbed persistence service. Nothing
+// else in the host reads this face.
+export const internals = {
+  pickFolder,
+  artifactCandidates,
+  assertListedPath,
+  removeOneFile,
+  claimQuarantineDirectory,
+  classifyPaths,
+  collectSessionPaths,
+  MAX_SCANNED,
+  findSessionCaches,
+  freeDestination,
+  identityKey,
+  insidePath,
+  listDirectories,
+  moveToSessionTrash,
+  planArtifacts,
+  quarantineFiles,
+  resolveQuarantineRoot,
+  removeForever,
+  deleteSession,
+  deleteSessions,
+  busyBackoff,
+  BUSY_RETRY_ATTEMPTS,
+  retirePaths,
+  retireTargets,
+  listSessionHeaders,
+  collectOrphans,
+  collectDescendants,
+  bareSessionId,
+  describeChildren,
+  selectChildDeletes,
+  runQuarantine,
+  sendToRecycleBin,
+  toolTarget,
+  trashCommandFor,
+  warmCompiledHelpers,
+}

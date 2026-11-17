@@ -1,0 +1,7 @@
+# dsh-excluir-sessao bundle patch: inserts the plugin row into the profile
+# roster. The node half serves the /dsh-excluir-sessao/* JSON routes; the
+# browser half (exports "./client") injects the sidebar session-row menu item
+# and the confirmation dialog.
+- insert:
+    - id: dsh-excluir-sessao
+      name: 'dsh-excluir-sessao'

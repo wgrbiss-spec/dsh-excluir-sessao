@@ -1,0 +1,61 @@
+{
+  "name": "dsh-excluir-sessao",
+  "version": "0.1.0",
+  "description": "EXCLUIR SESSÃO PARA O DEEPSEEK HARNESS — adiciona a ação Excluir sessão ao menu da barra lateral, com diálogo de confirmação, envio para a lixeira do sistema (ou remoção definitiva) e quarentena opcional dos arquivos produzidos pela conversa. Todo o texto da interface em português do Brasil. · Brazilian Portuguese fork of dsh-delete-session.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "test",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "session",
+    "delete",
+    "portuguese",
+    "pt-br",
+    "excluir-sessao"
+  ],
+  "license": "MIT",
+  "author": "wgrbiss-spec",
+  "homepage": "https://github.com/wgrbiss-spec/dsh-excluir-sessao#readme",
+  "bugs": {
+    "url": "https://github.com/wgrbiss-spec/dsh-excluir-sessao/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wgrbiss-spec/dsh-excluir-sessao.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "platform": "web"
+    }
+  }
+}
